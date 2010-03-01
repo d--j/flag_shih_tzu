@@ -2,6 +2,7 @@
 
 module FlagShihTzu
   TRUE_VALUES = [true, 1, '1', 't', 'T', 'true', 'TRUE'] # taken from ActiveRecord::ConnectionAdapters::Column
+  DEFAULT_COLUMN_NAME = 'flags'
 
   def self.included(base)
     base.extend(ClassMethods)
@@ -13,31 +14,25 @@ module FlagShihTzu
 
   module ClassMethods
     def has_flags(*args)
-      flag_hash, options = parse_options(*args)
-      options = {
+      flag_hash, opts = parse_options(*args)
+      opts = {
         :named_scopes => true, 
-        :column => 'flags', 
+        :column => DEFAULT_COLUMN_NAME, 
         :flag_query_mode => :in_list
-      }.update(options)
+      }.update(opts)
+      colmn = opts[:column]
 
-      class_inheritable_reader :flag_column
-      write_inheritable_attribute(:flag_column, options[:column])
+      return unless check_flag_column(colmn)
 
-      return unless check_flag_column(flag_column)
-
-
-      class_inheritable_hash :flag_query_mode
-      write_inheritable_attribute(:flag_query_mode, {}) if flag_query_mode.nil?
-      # initialize flag_query_mode for this column
-      flag_query_mode[flag_column] = options[:flag_query_mode]
-
-
+      # options are stored in a class level hash and apply per-column
+      class_inheritable_hash :flag_options
+      write_inheritable_attribute(:flag_options, {}) if flag_options.nil?
+      flag_options[colmn] = opts
+      
+      # the mappings are stored in this class level hash and apply per-column
       class_inheritable_hash :flag_mapping
-      # if has_flags is used more than once in a single class, then flag_mapping will already have data in it in successive declarations
       write_inheritable_attribute(:flag_mapping, {}) if flag_mapping.nil?
-
-      # initialize flag_mapping for this column
-      flag_mapping[flag_column] ||= {}
+      flag_mapping[colmn] ||= {}
 
 
       flag_hash.each do |flag_key, flag_name|
@@ -45,31 +40,31 @@ module FlagShihTzu
         raise ArgumentError, "has_flags: flag names should be symbols, and #{flag_name} is not" unless is_valid_flag_name(flag_name)
         raise ArgumentError, "has_flags: flag name #{flag_name} already defined, please choose different name" if method_defined?(flag_name)
 
-        flag_mapping[flag_column][flag_name] = 1 << (flag_key - 1)
+        flag_mapping[colmn][flag_name] = 1 << (flag_key - 1)
 
         class_eval <<-EVAL
           def #{flag_name}
-            flag_enabled?(:#{flag_name}, '#{flag_column}')
+            flag_enabled?(:#{flag_name}, '#{colmn}')
           end
 
           def #{flag_name}?
-            flag_enabled?(:#{flag_name}, '#{flag_column}')
+            flag_enabled?(:#{flag_name}, '#{colmn}')
           end
 
           def #{flag_name}=(value)
-            FlagShihTzu::TRUE_VALUES.include?(value) ? enable_flag(:#{flag_name}, '#{flag_column}') : disable_flag(:#{flag_name}, '#{flag_column}')
+            FlagShihTzu::TRUE_VALUES.include?(value) ? enable_flag(:#{flag_name}, '#{colmn}') : disable_flag(:#{flag_name}, '#{colmn}')
           end
 
           def self.#{flag_name}_condition
-            sql_condition_for_flag(:#{flag_name}, '#{flag_column}', true)
+            sql_condition_for_flag(:#{flag_name}, '#{colmn}', true)
           end
 
           def self.not_#{flag_name}_condition
-            sql_condition_for_flag(:#{flag_name}, '#{flag_column}', false)
+            sql_condition_for_flag(:#{flag_name}, '#{colmn}', false)
           end
         EVAL
 
-        if respond_to?(:named_scope) && options[:named_scopes]
+        if respond_to?(:named_scope) && flag_options[colmn][:named_scopes]
           class_eval <<-EVAL
             named_scope :#{flag_name}, lambda { { :conditions => #{flag_name}_condition } }
             named_scope :not_#{flag_name}, lambda { { :conditions => not_#{flag_name}_condition } }
@@ -100,54 +95,48 @@ module FlagShihTzu
         return options, add_options
       end
 
-      def check_flag_column(colmn, custom_table_name = self.table_name)
+      def check_flag_column(colmn, table_name = self.table_name)
         # If you aren't using ActiveRecord (eg. you are outside rails) then do not fail here
         # If you are using ActiveRecord then you only want to check for the table if the table exists so it won't fail pre-migration
         has_ar = defined?(ActiveRecord) && self.is_a?(ActiveRecord::Base)
         # Supposedly Rails 2.3 takes care of this, but this precaution is needed for backwards compatibility
-        has_table = has_ar ? ActiveRecord::Base.connection.tables.include?(custom_table_name) : true
+        has_table = has_ar ? ActiveRecord::Base.connection.tables.include?(table_name) : true
 
-        logger.warn("Error: Table '#{custom_table_name}' doesn't exist") and return false unless has_table
+        logger.warn("Error: Table '#{table_name}' doesn't exist") and return false unless has_table
         
         if !has_ar || (has_ar && has_table)
-          has_column = columns.any? { |column| column.name == colmn }
-          is_integer_column = columns.any? { |column| column.name == colmn && column.type == :integer }
-
-          logger.warn("Warning: Table '#{custom_table_name}' must have an integer column named '#{colmn}' in order to use FlagShihTzu") and return false unless has_column
-
-          raise IncorrectFlagColumnException, "Warning: Column '#{colmn}'must be of type integer in order to use FlagShihTzu" unless is_integer_column
+          if found_column = columns.find {|column| column.name == colmn}
+            raise IncorrectFlagColumnException, "Warning: Column '#{colmn}'must be of type integer in order to use FlagShihTzu" unless found_column.type == :integer
+          else
+            # Do not raise an exception since the migration to add the flags column might still be pending
+            logger.warn("Warning: Table '#{table_name}' must have an integer column named '#{colmn}' in order to use FlagShihTzu") and return false
+          end
         end
         
         true
       end
 
-      def sql_condition_for_flag(flag, colmn, enabled = true, custom_table_name = self.table_name)
+      def sql_condition_for_flag(flag, colmn, enabled = true, table_name = self.table_name)
         check_flag(flag, colmn)
         
-        if flag_query_mode[flag_column] == :bit_operator
+        if flag_options[colmn][:flag_query_mode] == :bit_operator
           # use & bit operator directly in the SQL query.
           # This has the drawback of not using an index on the flags colum.
-          "(#{custom_table_name}.#{colmn} & #{flag_mapping[colmn][flag]} = #{enabled ? flag_mapping[colmn][flag] : 0})"
-        elsif flag_query_mode[flag_column] == :in_list
+          "(#{table_name}.#{colmn} & #{flag_mapping[colmn][flag]} = #{enabled ? flag_mapping[colmn][flag] : 0})"
+        elsif flag_options[colmn][:flag_query_mode] == :in_list
           # use IN() operator in the SQL query.
           # This has the drawback of becoming a big query when you have lots of flags.
           neg = enabled ? "" : "not "
-          "(#{custom_table_name}.#{colmn} #{neg}in (#{sql_in_for_flag(flag, colmn).join(',')}))"
+          "(#{table_name}.#{colmn} #{neg}in (#{sql_in_for_flag(flag, colmn).join(',')}))"
         else
           raise NoSuchFlagQueryModeException
         end
       end
 
-      def sql_set_for_flag(flag, colmn, enabled = true, custom_table_name = self.table_name)
-        check_flag(flag, colmn)
-
-        "#{custom_table_name}.#{colmn} = #{custom_table_name}.#{colmn} #{enabled ? "| " : "& ~" }#{flag_mapping[colmn][flag]}"
-      end
-      
       # returns an array of integers suitable for a SQL IN statement.
       def sql_in_for_flag(flag, colmn)
         val = flag_mapping[colmn][flag]
-        num = 2 ** flag_mapping[flag_column].length
+        num = 2 ** flag_mapping[flag_options[colmn][:column]].length
         (1..num).select {|i| i & val == val}
       end
     
@@ -160,6 +149,7 @@ module FlagShihTzu
       end
   end
 
+  # Performs the bitwise operation so the flag will return +true+.
   def enable_flag(flag, colmn = nil)
     colmn = determine_flag_colmn_for(flag) if colmn.nil?
     self.class.check_flag(flag, colmn)
@@ -167,6 +157,7 @@ module FlagShihTzu
     set_flags(self.flags(colmn) | self.class.flag_mapping[colmn][flag], colmn)
   end
 
+  # Performs the bitwise operation so the flag will return +false+.
   def disable_flag(flag, colmn = nil)
     colmn = determine_flag_colmn_for(flag) if colmn.nil?
     self.class.check_flag(flag, colmn)
@@ -188,7 +179,7 @@ module FlagShihTzu
     !flag_enabled?(flag, colmn)
   end
 
-  def flags(colmn = 'flags')
+  def flags(colmn = DEFAULT_COLUMN_NAME)
     self[colmn] || 0
   end
 
@@ -203,7 +194,7 @@ module FlagShihTzu
     end
 
     def determine_flag_colmn_for(flag)
-      return 'flags' if self.class.flag_mapping.nil?
+      return DEFAULT_COLUMN_NAME if self.class.flag_mapping.nil?
       self.class.flag_mapping.each_pair do |colmn, mapping|
         return colmn if mapping.include?(flag)
       end
