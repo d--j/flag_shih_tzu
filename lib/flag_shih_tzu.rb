@@ -98,7 +98,7 @@ module FlagShihTzu
       def check_flag_column(colmn, table_name = self.table_name)
         # If you aren't using ActiveRecord (eg. you are outside rails) then do not fail here
         # If you are using ActiveRecord then you only want to check for the table if the table exists so it won't fail pre-migration
-        has_ar = defined?(ActiveRecord) && self.is_a?(ActiveRecord::Base)
+        has_ar = !!defined?(ActiveRecord) && self.respond_to?(:descends_from_active_record?)
         # Supposedly Rails 2.3 takes care of this, but this precaution is needed for backwards compatibility
         has_table = has_ar ? ActiveRecord::Base.connection.tables.include?(table_name) : true
 
